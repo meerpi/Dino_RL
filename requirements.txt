@@ -1,0 +1,16 @@
+# DinoRL Training Dependencies (Linux/Cross-platform)
+# Core training - required
+torch>=2.0.0
+torchvision>=0.15.0
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# Browser automation for parallel environments
+playwright>=1.40.0
+
+# Already included with stable-baselines3, but listed for clarity
+matplotlib>=3.7.0
+pandas>=2.0.0
+
