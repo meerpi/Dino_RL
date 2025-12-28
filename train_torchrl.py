@@ -1,9 +1,8 @@
 """
 TorchRL Training Script for Chrome Dino.
 
-I'm using TorchRL here because it's built on PyTorch (which I know) but adds 
-all the RL primitives I'd otherwise have to write from scratch (like buffer management,
-parallel data collection, and PPO loss calculation). 
+I'm using TorchRL here because it's built on PyTorch (which I know) and I would like a little most customization 
+compared to stable baselines. 
 """
 
 import torch
@@ -23,7 +22,7 @@ from torchrl.envs import (
     ToTensorImage
 )
 from torchrl.collectors import SyncDataCollector
-from torchrl.data import ReplayBuffer, LazyMemmapStorage, CompositeSpec
+from torchrl.data import ReplayBuffer, LazyTensorStorage, CompositeSpec
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.modules import ProbabilisticActor, ValueOperator
@@ -174,8 +173,16 @@ def main():
         storing_device=cfg.device,
     )
     
-    replay_buffer = ReplayBuffer(storage=LazyMemmapStorage(cfg.frames_per_batch), batch_size=cfg.batch_size)
+    # 4. Buffer & Loss
+    # We use a ReplayBuffer to store the collected batch for PPO updates.
+    # Optimization: Since frames_per_batch (1000) fits easily in VRAM (~28MB), 
+    # we use 'LazyTensorStorage' on the GPU to avoid slow CPU<->GPU transfers.
+    replay_buffer = ReplayBuffer(
+        storage=LazyTensorStorage(max_size=cfg.frames_per_batch, device=cfg.device),
+        batch_size=cfg.batch_size,
+    )
     
+    advantage_module = GAE(gamma=cfg.gamma, lmbda=cfg.lmbda, value_network=value_op, average_gae=True)
     # Loss & Optimizer
     loss_module = ClipPPOLoss(
         actor_network=actor,
