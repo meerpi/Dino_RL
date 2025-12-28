@@ -1,8 +1,9 @@
 """
 TorchRL Training Script for Chrome Dino.
 
-This script manages the PPO training loop using TorchRL primitives.
-It handles parallel data collection, buffer management, and the PPO update logic.
+I'm using TorchRL here because it's built on PyTorch (which I know) but adds 
+all the RL primitives I'd otherwise have to write from scratch (like buffer management,
+parallel data collection, and PPO loss calculation). 
 """
 
 import torch
@@ -55,13 +56,18 @@ cfg = Config()
 
 class DinoCNN(nn.Module):
     """
-    Simple CNN architecture for 84x84 grayscale observation.
-    Extracts features and splits into Actor and Critic heads.
+    My custom Neural Network for playing Dino.
+    
+    It takes the screen as input and outputs two things:
+    1. **Actor**: Which button to press (Jump, Duck, or Nothing)?
+    2. **Critic**: How "good" is the current situation? (Used for training stability)
     """
     def __init__(self, action_dim=3):
         super().__init__()
         
-        # 84x84 inputs
+        # 3-layer CNN to process the 84x84 images.
+        # This architecture is based on the famous DQN Nature paper (Mnih et al., 2015).
+        # It's surprisingly good at "seeing" simple games like this.
         self.feature_extractor = nn.Sequential(
             nn.Conv2d(4, 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -72,15 +78,17 @@ class DinoCNN(nn.Module):
             nn.Flatten()
         )
         
-        # Calculated feature size: 64 * 7 * 7
+        # Calculated feature size: 64 * 7 * 7 = 3136
         self.feature_size = 64 * 7 * 7
         
+        # The Actor Head: Outputs logits for 3 actions
         self.actor = nn.Sequential(
             nn.Linear(self.feature_size, 512),
             nn.ReLU(),
             nn.Linear(512, action_dim),
         )
         
+        # The Critic Head: Outputs a single value estimate (V(s))
         self.critic = nn.Sequential(
             nn.Linear(self.feature_size, 512),
             nn.ReLU(),
@@ -94,7 +102,15 @@ def make_env(device="cpu"):
     env = GymWrapper(env, device=device)
     
 def make_env(device="cpu"):
-    """Creates a TransformedEnv for TorchRL with 84x84 grayscale stacking."""
+    """
+    Factory function to create the environment.
+    
+    We wrap the base Playwright environment with a few transforms:
+    - **ToTensorImage**: Converts raw pixels to PyTorch tensors.
+    - **CatFrames**: Stacks 4 frames together. This gives the agent a sense of "motion"
+      (velocity/acceleration) that a single static frame can't provide.
+    - **StepCounter**: Hard limit on episode length to prevent infinite loops if the agent gets too good.
+    """
     env = GymWrapper(DinoPlaywrightEnv(headless=True), device=device)
     return TransformedEnv(env, Compose(
         ToTensorImage(),
@@ -119,22 +135,36 @@ def main():
     # Common feature extractor
     feature_module = TensorDictModule(net.feature_extractor, in_keys=["pixels"], out_keys=["features"])
     
-    # Actor (Probabilistic)
+    # Actor and Critic heads as TensorDictModules
+    policy_head_module = TensorDictModule(net.actor, in_keys=["features"], out_keys=["logits"])
+    value_head_module = TensorDictModule(net.critic, in_keys=["features"], out_keys=["state_value"])
+
+    # Sequential containers
+    # We pipeline the feature extractor with the respective heads.
+    policy_seq = nn.Sequential(feature_module, policy_head_module)
+    value_seq = nn.Sequential(feature_module, value_head_module)
+    
+    # Probabilistic Actor
+    # This module handles the sampling logic (e.g., choosing an action based on probabilities).
     actor = ProbabilisticActor(
-        module=nn.Sequential(feature_module, TensorDictModule(net.actor, in_keys=["features"], out_keys=["logits"])),
+        module=policy_seq,
         spec=CompositeSpec(action=dummy_env.action_spec),
         in_keys=["logits"],
         distribution_class=Categorical,
         return_log_prob=True,
     )
     
-    # Critic (Value)
+    # Value Operator (Critic)
+    # This just outputs the raw value number.
     value_op = ValueOperator(
-        module=nn.Sequential(feature_module, TensorDictModule(net.critic, in_keys=["features"], out_keys=["state_value"])),
+        module=value_seq,
         in_keys=["pixels"],
     )
     
-    # Collector & Buffer
+    # 3. Data Collection
+    # The Collector is the workhorse. It runs the policy in the environment 
+    # and gathers batches of data. 'SyncDataCollector' means it waits for all
+    # envs to finish a batch before returning.
     collector = SyncDataCollector(
         create_env_fn=[create_env_fn] * cfg.num_envs,
         policy=actor,
@@ -168,7 +198,9 @@ def main():
         # Train step
         with torch.no_grad(): advantage_module(data)
         replay_buffer.extend(data.reshape(-1))
-        
+        # PPO Update Loop
+        # We iterate multiple times over the collected batch to squeeze out as much 
+        # learning as possible (that's the "Proximal" part of PPO - making sure we don't change too much).
         for _ in range(cfg.num_epochs):
             for _ in range(cfg.frames_per_batch // cfg.batch_size):
                 loss = loss_module(replay_buffer.sample())

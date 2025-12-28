@@ -16,11 +16,11 @@ from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
 class DinoPlaywrightEnv(gym.Env):
     """
-    A custom Gymnasium environment that wraps the Chrome Dino game using Playwright.
-    
-    This class handles the browser interaction, game state extraction, and 
-    synchronization between the agent's actions and the game's execution.
-    It supports running in headless mode for efficient training on servers.
+    A custom Gymnasium environment for the Chrome Dino game, controllable via Playwright.
+
+    I chose Playwright over Selenium because it supports 'browser contexts', which are like 
+    incognito windows that share a single browser process. This means we can run 4+ environments 
+    in parallel without eating up all the RAM!
     """
     
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -34,14 +34,17 @@ class DinoPlaywrightEnv(gym.Env):
         observation_size: tuple = (84, 84),
     ):
         """
-        Sets up the environment, including the observation and action spaces.
-        
+        Initializes the environment.
+
         Args:
-            game_url: The URL or file path to the game. Defaults to the local version.
-            headless: If True, runs the browser in the background (no GUI).
-            render_mode: How to display the game ("human" for GUI, "rgb_array" for pixels).
-            frame_skip: How many game frames to advance per agent action (standard is 4).
-            observation_size: The resolution of the grayscale observation image (H, W).
+            game_url: Path to the game file. If not provided, it finds the local 'index.html'.
+            headless: We usually run headless (no window) to speed up training, but can set this 
+                     to False if we want to watch the Dino jump around.
+            render_mode: 'human' for display, 'rgb_array' for the raw pixels the agent sees.
+            frame_skip: The agent only sees every 4th frame. This is a standard RL trick (like in Atari)
+                       because nothing much changes in 1/60th of a second, so it saves computation.
+            observation_size: We downscale the screen to 84x84 grayscale to make it easier for 
+                            the CNN to process.
         """
         super().__init__()
         
@@ -106,16 +109,19 @@ class DinoPlaywrightEnv(gym.Env):
     
     def _get_game_state(self) -> dict:
         """
-        Retrieves the full game state directly from the JavaScript runtime.
+        Injects JavaScript into the browser to steal the internal game state.
         
-        Returns:
-            A dictionary containing the crash status, score, speed, and obstacle positions.
+        This is a bit of a hack, but it allows us to get the exact score, speed, and 
+        obstacle positions directly from the game's variables (`Runner.instance_`).
+        Much cleaner than trying to OCR the score from the screen!
         """
         state = self._page.evaluate("""
             () => {
                 const runner = Runner.instance_;
                 if (!runner) return null;
                 
+                // We need to know where the obstacles are to help debug, 
+                // though the agent mainly looks at the pixels.
                 let obstacles = [];
                 if (runner.horizon && runner.horizon.obstacles) {
                     for (let obs of runner.horizon.obstacles) {
@@ -151,10 +157,13 @@ class DinoPlaywrightEnv(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Captures the game canvas and processes it into a normalized grayscale observation.
+        Takes a screenshot of the browser canvas and processes it for the Neural Network.
         
-        Returns:
-            An (84, 84) numpy array representing the game screen.
+        We do a few image processing steps here:
+        1. Capture raw bytes from Playwright
+        2. Convert to grayscale (color doesn't matter for Dino)
+        3. Invert colors (we want white features on black background, typically easier for CNNs)
+        4. Resize to 84x84 (standard size from the DeepMind Atari papers)
         """
         canvas = self._page.locator('canvas')
         screenshot_bytes = canvas.screenshot()
@@ -187,10 +196,15 @@ class DinoPlaywrightEnv(gym.Env):
     
     def _calculate_reward(self, state: dict, action: int) -> float:
         """
-        Computes the reward for the current step based on the game state.
+        Calculates the reward to guide the agent.
         
-        The reward function incentivizes survival and score accumulation while
-        applying a small penalty for actions to discourage spamming.
+        This was tricky to tune!
+        - **Survival Reward (+0.1):** We want it to stay alive.
+        - **Score Reward (+ difference):** If the score goes up, give it a treat.
+        - **Death Penalty (-10.0):** Crashing is very bad.
+        - **Action Penalty (-0.01):** We subtract a tiny bit for jumping or ducking. 
+          Why? To stop it from spamming jump constantly (it looks silly and is inefficient). 
+          We want it to only jump when it *needs* to.
         """
         if state['crashed']:
             return -10.0
@@ -252,39 +266,45 @@ class DinoPlaywrightEnv(gym.Env):
     
     def step(self, action: int):
         """
-        Advances the environment by one step given an action.
+        Runs one timestep of the game.
         
-        Returns:
-            A tuple of (observation, reward, terminated, truncated, info).
+        This logic is wrapped in a try/except merely to catch things like the 
+        browser crashing or the network hanging. If that happens, we just tell 
+        the RL loop that the episode ended unexpectedly.
         """
         self.current_step += 1
         action = int(action)
         
-        self._do_action(action)
-        time.sleep(0.016 * self.frame_skip)
-        
-        state = self._get_game_state()
-        
-        if state is None:
-            # If state is None here, something significant broke in the JS
-            # or the browser context is gone.
+        try:
+            self._do_action(action)
+            # Sleep here to simulate the frame rate (60 FPS / frame_skip)
+            time.sleep(0.016 * self.frame_skip)
+            
+            state = self._get_game_state()
+            
+            if state is None:
+                obs = np.zeros(self.observation_size, dtype=np.uint8)
+                return obs, -10.0, True, False, {'error': 'game_not_ready'}
+            
+            obs = self._get_observation()
+            reward = self._calculate_reward(state, action)
+            self.episode_reward += reward
+            
+            terminated = state['crashed']
+            truncated = self.current_step >= self.max_steps
+            
+            info = {
+                'score': state.get('score', 0),
+                'step': self.current_step,
+                'speed': state.get('speed', 0)
+            }
+            
+            return obs, reward, terminated, truncated, info
+            
+        except Exception as e:
+            # If the browser disconnects or something breaks, fail the episode gracefully
             obs = np.zeros(self.observation_size, dtype=np.uint8)
-            return obs, -10.0, True, False, {'error': 'game_not_ready'}
-        
-        obs = self._get_observation()
-        reward = self._calculate_reward(state, action)
-        self.episode_reward += reward
-        
-        terminated = state['crashed']
-        truncated = self.current_step >= self.max_steps
-        
-        info = {
-            'score': state.get('score', 0),
-            'step': self.current_step,
-            'speed': state.get('speed', 0)
-        }
-        
-        return obs, reward, terminated, truncated, info
+            return obs, -10.0, True, False, {'error': str(e)}
     
     def render(self):
         """Returns the current observation frame."""
@@ -303,7 +323,7 @@ class DinoPlaywrightEnv(gym.Env):
 
 def make_env(env_id: int = 0, headless: bool = True, game_url: str = None):
     """
-    Helper function to create environment instances, primarily for vectorized environments.
+    Helper function to create environment instances, primarily for Multi ENV environments.
     """
     def _init():
         env = DinoPlaywrightEnv(
